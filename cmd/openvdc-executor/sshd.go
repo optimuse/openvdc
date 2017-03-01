@@ -3,17 +3,20 @@ package main
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"fmt"
 	"io"
 	"net"
+	"runtime"
+	"syscall"
 
-	"github.com/pkg/errors"
+	"os/exec"
 
-	"crypto/elliptic"
-
+	log "github.com/Sirupsen/logrus"
 	"github.com/axsh/openvdc/hypervisor"
+	"github.com/pkg/errors"
 	"golang.org/x/crypto/ed25519"
 	"golang.org/x/crypto/ssh"
 )
@@ -98,6 +101,7 @@ func (sshd *SSHServer) handleChannels(chans <-chan ssh.NewChannel, instanceID st
 type sshSession struct {
 	instanceID string
 	sshd       *SSHServer
+	ptyreq     *hypervisor.SSHPtyReq
 }
 
 func (session *sshSession) handleChannel(newChannel ssh.NewChannel) {
@@ -107,13 +111,6 @@ func (session *sshSession) handleChannel(newChannel ssh.NewChannel) {
 		return
 	}
 	defer func() {
-		msg := struct {
-			ExitStatus uint32
-		}{uint32(0)}
-		_, err := connection.SendRequest("exit-status", false, ssh.Marshal(&msg))
-		if err != nil {
-			log.WithError(err).Error("Failed to send exit-status")
-		}
 		if err := connection.CloseWrite(); err != nil && err != io.EOF {
 			log.WithError(err).Warn("Failed CloseWrite()")
 		}
@@ -139,20 +136,27 @@ Done:
 			if r == nil {
 				break Done
 			}
+			log := log.WithField("sshreq", r.Type)
+			reply := true
 			switch r.Type {
 			case "shell":
-				if err := console.Attach(connection, connection, connection.Stderr()); err != nil {
-					log.Error(err)
-					return
+				ptycon, ok := console.(hypervisor.PtyConsole)
+				if session.ptyreq != nil && ok {
+					if err := ptycon.AttachPty(connection, connection, connection.Stderr(), session.ptyreq); err != nil {
+						reply = false
+						log.WithError(err).Error("Failed console.AttachPty")
+					}
+				} else {
+					if err := console.Attach(connection, connection, connection.Stderr()); err != nil {
+						reply = false
+						log.WithError(err).Error("Failed console.Attach")
+					}
 				}
-
-				go func() {
-					quit <- console.Wait()
-				}()
-				if err := r.Reply(true, nil); err != nil {
-					log.WithError(err).Warn("Failed to reply")
+				if reply == true {
+					go func() {
+						quit <- console.Wait()
+					}()
 				}
-
 			case "signal":
 				var msg struct {
 					Signal string
@@ -170,29 +174,51 @@ Done:
 					log.Warn("FIXME: Uncovered signal request: ", msg.Signal)
 				}
 			case "pty-req":
-				var ptyReq struct {
-					Term     string
-					Columns  uint32
-					Rows     uint32
-					Width    uint32
-					Height   uint32
-					Modelist string
-				}
-				if err := ssh.Unmarshal(r.Payload, &ptyReq); err != nil {
-					log.WithError(err).Error("Failed to parse pty-req message")
-				}
-				if err := r.Reply(true, nil); err != nil {
-					log.WithError(err).Warn("Failed to reply")
+				ptyreq := new(hypervisor.SSHPtyReq)
+				if err := ssh.Unmarshal(r.Payload, ptyreq); err != nil {
+					reply = false
+					log.WithError(errors.WithStack(err)).Error("Failed to parse message")
+				} else {
+					session.ptyreq = ptyreq
 				}
 			default:
-				if r.WantReply {
-					r.Reply(false, nil)
+				reply = false
+				log.Warn("Unsupported session request")
+			}
+
+			if r.WantReply {
+				if err := r.Reply(reply, nil); err != nil {
+					log.WithError(errors.WithStack(err)).Warn("Failed to reply")
 				}
-				log.Warn("Unsupported session request: ", r.Type)
 			}
 		case err := <-quit:
-			if err != nil {
+			sendExitStatus := func(code uint32) {
+				msg := struct {
+					ExitStatus uint32
+				}{uint32(code)}
+				_, err := connection.SendRequest("exit-status", false, ssh.Marshal(&msg))
+				if err != nil {
+					log.WithError(err).Error("Failed to send exit-status")
+				}
+			}
+
+			if exiterr, ok := err.(*exec.ExitError); ok {
+				// http://stackoverflow.com/questions/10385551/get-exit-code-go
+				if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
+					sendExitStatus(uint32(status.ExitStatus()))
+				} else {
+					log.Warnf("This platform %s does not support syscall.WaitStatus: %v", runtime.GOOS, exiterr)
+					if exiterr.Success() {
+						sendExitStatus(0)
+					} else {
+						sendExitStatus(1)
+					}
+				}
+			} else if err != nil {
 				log.WithError(err).Error("")
+			} else {
+				// err == nil
+				sendExitStatus(0)
 			}
 			break Done
 		}
