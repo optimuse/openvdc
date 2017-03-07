@@ -8,6 +8,8 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"syscall"
 	"text/template"
 	"time"
@@ -148,20 +150,20 @@ func (d *LXCHypervisorDriver) modifyConf(resource *model.LxcTemplate) error {
 	// Append comment header
 	fmt.Fprintf(lxcconf, "\n# OpenVDC Network Configuration\n")
 
-	if lxc.VersionAtLeast(1,1,0) {
+	if lxc.VersionAtLeast(1, 1, 0) {
 		/*
-		https://linuxcontainers.org/lxc/manpages/man5/lxc.container.conf.5.html
-		lxc.network
-		may be used without a value to clear all previous network options.
+			https://linuxcontainers.org/lxc/manpages/man5/lxc.container.conf.5.html
+			lxc.network
+			may be used without a value to clear all previous network options.
 
-		However requires the change 6b0d5538.
-		https://github.com/lxc/lxc/commit/6b0d553864a16462850d87d4d2e9056ea136ebad
+			However requires the change 6b0d5538.
+			https://github.com/lxc/lxc/commit/6b0d553864a16462850d87d4d2e9056ea136ebad
 		*/
 		fmt.Fprintf(lxcconf, "# Here clear all network options.\nlxc.network=\n")
-	}else{
+	} else {
 		/*
-		lxc.network.type with no value does same thing.
-		https://github.com/lxc/lxc/blob/stable-1.0/src/lxc/confile.c#L369-L377
+			lxc.network.type with no value does same thing.
+			https://github.com/lxc/lxc/blob/stable-1.0/src/lxc/confile.c#L369-L377
 		*/
 		fmt.Fprintf(lxcconf, "# Here clear all network options.\nlxc.network.type=\n")
 	}
@@ -184,10 +186,10 @@ func (d *LXCHypervisorDriver) modifyConf(resource *model.LxcTemplate) error {
 				DownScript string
 				IFIndex    int
 			}{
-				IFace:   i,
-				IFIndex: idx,
-				TapName: fmt.Sprintf("%s_%02d", d.container.Name(), idx),
-				UpScript: filepath.Join(d.containerDir(), "up.sh"),
+				IFace:      i,
+				IFIndex:    idx,
+				TapName:    fmt.Sprintf("%s_%02d", d.container.Name(), idx),
+				UpScript:   filepath.Join(d.containerDir(), "up.sh"),
 				DownScript: filepath.Join(d.containerDir(), "down.sh"),
 			}
 			if err := nwTemplate.Execute(lxcconf, tval); err != nil {
@@ -249,7 +251,7 @@ func (d *LXCHypervisorDriver) CreateInstance(i *model.Instance, in model.Resourc
 
 	// Force reload the modified container config.
 	d.container.ClearConfig()
-	if err := d.container.LoadConfigFile( d.container.ConfigFileName() ); err != nil {
+	if err := d.container.LoadConfigFile(d.container.ConfigFileName()); err != nil {
 		return errors.Wrap(err, "Failed lxc.LoadConfigFile")
 	}
 
@@ -318,6 +320,14 @@ func (d *LXCHypervisorDriver) StopInstance() error {
 	return nil
 }
 
+func (d *LXCHypervisorDriver) RebootInstance() error {
+	d.log.Infoln("Rebooting lxc-container..")
+	if err := d.container.Reboot(); err != nil {
+		return errors.Wrap(err, "Failed lxc.Reboot")
+	}
+	return nil
+}
+
 func (d *LXCHypervisorDriver) InstanceConsole() hypervisor.Console {
 	return &lxcConsole{
 		lxc: d,
@@ -335,9 +345,17 @@ func (con *lxcConsole) container() *lxc.Container {
 	return con.lxc.container
 }
 
-func (con *lxcConsole) Attach(stdin io.Reader, stdout, stderr io.Writer) error {
+func (con *lxcConsole) Exec(param *hypervisor.ConsoleParam, args []string) (<-chan hypervisor.Closed, error) {
+	return con.pipeAttach(param, args)
+}
+
+func (con *lxcConsole) Attach(param *hypervisor.ConsoleParam) (<-chan hypervisor.Closed, error) {
+	return con.pipeAttach(param, []string{"/bin/bash"})
+}
+
+func (con *lxcConsole) pipeAttach(param *hypervisor.ConsoleParam, args []string) (<-chan hypervisor.Closed, error) {
 	if con.container().State() != lxc.RUNNING {
-		return errors.New("lxc-container can not perform console")
+		return nil, errors.New("lxc-container can not perform console")
 	}
 
 	fds := make([]*os.File, 6)
@@ -350,84 +368,175 @@ func (con *lxcConsole) Attach(stdin io.Reader, stdout, stderr io.Writer) error {
 	var err error
 	rIn, wIn, err := os.Pipe() // stdin
 	if err != nil {
-		return errors.Wrap(err, "Failed os.Pipe for stdin")
+		return nil, errors.Wrap(err, "Failed os.Pipe for stdin")
 	}
 	fds = append(fds, rIn, wIn)
 	con.fds = append(con.fds, wIn)
 	rOut, wOut, err := os.Pipe() // stdout
 	if err != nil {
 		defer closeAll()
-		return errors.Wrap(err, "Failed os.Pipe for stdout")
+		return nil, errors.Wrap(err, "Failed os.Pipe for stdout")
 	}
 	fds = append(fds, rOut, wOut)
 	con.fds = append(con.fds, rOut)
 	rErr, wErr, err := os.Pipe() // stderr
 	if err != nil {
 		defer closeAll()
-		return errors.Wrap(err, "Failed os.Pipe for stderr")
+		return nil, errors.Wrap(err, "Failed os.Pipe for stderr")
 	}
 	fds = append(fds, rErr, wErr)
 	con.fds = append(con.fds, rErr)
 
-	go io.Copy(wIn, stdin)
-	go io.Copy(stdout, rOut)
-	go io.Copy(stderr, rErr)
+	waitClosed := new(sync.WaitGroup)
+	closeChan := make(chan hypervisor.Closed, 3)
+	waitClosed.Add(1)
+	go func() {
+		_, err := io.Copy(wIn, param.Stdin)
+		if err == nil {
+			// param.Stdin was closed due to EOF so needs to send EOF to pipe as well
+			wIn.Close()
+		}
+		// TODO: handle err is not nil case
+		closeChan <- err
+		defer waitClosed.Done()
+	}()
+	waitClosed.Add(1)
+	go func() {
+		_, err := io.Copy(param.Stdout, rOut)
+		closeChan <- err
+		defer waitClosed.Done()
+	}()
+	waitClosed.Add(1)
+	go func() {
+		_, err := io.Copy(param.Stderr, rErr)
+		closeChan <- err
+		defer waitClosed.Done()
+	}()
+	go func() {
+		waitClosed.Wait()
+		defer close(closeChan)
+	}()
 
-	err = con.attachShell(rIn, wOut, wErr)
+	err = con.attachShell(rIn, wOut, wErr, param.Envs, args)
 	if err != nil {
-		defer closeAll()
-		return err
+		defer func() {
+			closeAll()
+			con.fds = []*os.File{}
+		}()
+		return nil, err
 	}
 
 	// Close file descriptors for child process.
-	defer func () {
+	defer func() {
 		rIn.Close()
 		wOut.Close()
 		wErr.Close()
 	}()
 
-	return nil
+	return closeChan, nil
 }
 
-func (con *lxcConsole) AttachPty(stdin io.Reader, stdout, stderr io.Writer, ptyreq *hypervisor.SSHPtyReq) error {
+func (con *lxcConsole) AttachPty(param *hypervisor.ConsoleParam, ptyreq *hypervisor.SSHPtyReq) (<-chan hypervisor.Closed, error) {
 	if con.container().State() != lxc.RUNNING {
-		return errors.New("lxc-container can not perform console")
+		return nil, errors.New("lxc-container can not perform console")
 	}
 
 	fpty, ftty, err := pty.Open()
 	if err != nil {
-		return errors.Wrapf(err, "Failed to open tty")
+		return nil, errors.Wrapf(err, "Failed to open tty")
 	}
 	// Close primary socket
 	defer ftty.Close()
 	con.fds = append(con.fds, fpty)
 
-	go io.Copy(fpty, stdin)
-	go io.Copy(stdout, fpty)
-	go io.Copy(stderr, fpty)
+	waitClosed := new(sync.WaitGroup)
+	closeChan := make(chan hypervisor.Closed, 3)
+	waitClosed.Add(1)
+	go func() {
+		_, err := io.Copy(fpty, param.Stdin)
+		if err == nil {
+			// param.Stdin was closed due to EOF so needs to send EOF to pty as well
+			fpty.Close()
+		}
+		// TODO: handle err is not nil case
+		closeChan <- err
+		defer waitClosed.Done()
+	}()
+	waitClosed.Add(1)
+	go func() {
+		_, err := io.Copy(param.Stdout, fpty)
+		closeChan <- err
+		defer waitClosed.Done()
+	}()
+	waitClosed.Add(1)
+	go func() {
+		_, err := io.Copy(param.Stderr, fpty)
+		closeChan <- err
+		defer waitClosed.Done()
+	}()
+	go func() {
+		waitClosed.Wait()
+		defer close(closeChan)
+	}()
 
-	SetWinsize(ftty.Fd(), &Winsize{Height: uint16(ptyreq.Height), Width: uint16(ptyreq.Width)})
+	SetWinsize(ftty.Fd(), &Winsize{Height: uint16(ptyreq.Rows), Width: uint16(ptyreq.Columns)})
 	/*
-	modes, err := TcGetAttr(ftty.Fd())
-	if err != nil {
-		return errors.Wrap(err, "Failed TcGetAttr")
-	}
-	modes.Lflag &^= syscall.ECHO
-	modes.Iflag |= syscall.IGNCR
-	err = TcSetAttr(ftty.Fd(), modes)
-	if err != nil {
-		return errors.Wrap(err, "Failed TcSetAttr")
-	}
+		modes, err := TcGetAttr(ftty.Fd())
+		if err != nil {
+			return errors.Wrap(err, "Failed TcGetAttr")
+		}
+		modes.Lflag &^= syscall.ECHO
+		modes.Iflag |= syscall.IGNCR
+		err = TcSetAttr(ftty.Fd(), modes)
+		if err != nil {
+			return errors.Wrap(err, "Failed TcSetAttr")
+		}
 	*/
 
-	err = con.attachShell(ftty, ftty, ftty)
+	if ptyreq.Term != "" {
+		param.Envs["TERM"] = ptyreq.Term
+	}
+	err = con.attachShell(ftty, ftty, ftty, param.Envs, []string{"/bin/bash"})
 	if err != nil {
-		defer fpty.Close()
-		return err
+		defer func() {
+			fpty.Close()
+			con.fds = []*os.File{}
+		}()
+		return nil, err
 	}
 	con.tty = ftty.Name()
-	return nil
+	return closeChan, nil
 	//return con.console(stdin, stdout, stderr)
+}
+
+func (con *lxcConsole) UpdateWindowSize(w, h uint32) error {
+	if !(len(con.fds) == 1) {
+		return errors.New("tty is not opened")
+	}
+	return SetWinsize(con.fds[0].Fd(), &Winsize{
+		Width:  uint16(w),
+		Height: uint16(h),
+	})
+}
+
+type consoleWaitError struct {
+	os.ProcessState
+}
+
+func (c *consoleWaitError) Error() string {
+	return c.ProcessState.String()
+}
+
+func (c *consoleWaitError) ExitCode() int {
+	// http://stackoverflow.com/questions/10385551/get-exit-code-go
+	if status, ok := c.Sys().(syscall.WaitStatus); ok {
+		return status.ExitStatus()
+	}
+	log.Warnf("This platform %s does not support syscall.WaitStatus", runtime.GOOS)
+	if !c.Success() {
+		return 1
+	}
+	return 0
 }
 
 func (con *lxcConsole) Wait() error {
@@ -449,11 +558,18 @@ func (con *lxcConsole) Wait() error {
 		log.Info("Closed attached session")
 	}()
 
-	_, err := con.attached.Wait()
+	state, err := con.attached.Wait()
 	if err != nil {
 		con.attached.Release()
+		return errors.Wrap(err, "Failed Process.Wait")
 	}
-	return errors.Wrap(err, "Failed Process.Wait")
+
+	if !state.Success() {
+		return &consoleWaitError{
+			ProcessState: *state,
+		}
+	}
+	return nil
 }
 
 func (con *lxcConsole) ForceClose() error {
@@ -465,14 +581,21 @@ func (con *lxcConsole) ForceClose() error {
 	return errors.WithStack(con.attached.Kill())
 }
 
-func (con *lxcConsole) attachShell(stdin, stdout, stderr *os.File) error {
+func (con *lxcConsole) attachShell(stdin, stdout, stderr *os.File, envs map[string]string, args []string) error {
 	options := lxc.DefaultAttachOptions
 	options.StdinFd = stdin.Fd()
 	options.StdoutFd = stdout.Fd()
 	options.StderrFd = stderr.Fd()
 	options.ClearEnv = true
+	if len(envs) > 0 {
+		s := make([]string, len(envs))
+		for k, v := range envs {
+			s = append(s, fmt.Sprintf("%s=%s", k, v))
+		}
+		options.Env = s
+	}
 
-	pid, err := con.container().RunCommandNoWait([]string{"/bin/bash"}, options)
+	pid, err := con.container().RunCommandNoWait(args, options)
 	if err != nil {
 		return errors.Wrap(err, "Failed lxc.RunCommandNoWait")
 	}

@@ -9,10 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"runtime"
-	"syscall"
-
-	"os/exec"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/axsh/openvdc/hypervisor"
@@ -80,36 +76,41 @@ func (sshd *SSHServer) Run(listener net.Listener) {
 			log.Error("Failed to handshake:", err)
 			continue
 		}
-		instanceID := sshConn.User()
 		log.Printf("New SSH connection from %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
 		go ssh.DiscardRequests(reqs)
-		go sshd.handleChannels(chans, instanceID)
-	}
-}
-
-func (sshd *SSHServer) handleChannels(chans <-chan ssh.NewChannel, instanceID string) {
-	for newChannel := range chans {
-		if t := newChannel.ChannelType(); t != "session" {
-			newChannel.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %s", t))
-			continue
-		}
-		session := sshSession{instanceID: instanceID, sshd: sshd}
-		go session.handleChannel(newChannel)
+		go func() {
+			for newChannel := range chans {
+				if t := newChannel.ChannelType(); t != "session" {
+					newChannel.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %s", t))
+					continue
+				}
+				session := sshSession{
+					instanceID: sshConn.User(),
+					sshd:       sshd,
+					peer:       sshConn.RemoteAddr(),
+				}
+				go session.handleChannel(newChannel)
+			}
+		}()
 	}
 }
 
 type sshSession struct {
 	instanceID string
 	sshd       *SSHServer
+	peer       net.Addr
 	ptyreq     *hypervisor.SSHPtyReq
+	console    *hypervisor.ConsoleParam
 }
 
 func (session *sshSession) handleChannel(newChannel ssh.NewChannel) {
+	log := log.WithField("instance_id", session.instanceID).WithField("peer", session.peer.String())
 	connection, req, err := newChannel.Accept()
 	if err != nil {
 		log.Error("Could not accept channel:", err)
 		return
 	}
+	session.console = hypervisor.NewConsoleParam(connection, connection, connection.Stderr())
 	defer func() {
 		if err := connection.CloseWrite(); err != nil && err != io.EOF {
 			log.WithError(err).Warn("Failed CloseWrite()")
@@ -117,7 +118,7 @@ func (session *sshSession) handleChannel(newChannel ssh.NewChannel) {
 		if err := connection.Close(); err != nil && err != io.EOF {
 			log.WithError(err).Warn("Invalid close sequence")
 		}
-		log.WithField("instance_id", session.instanceID).Info("Session closed")
+		log.Info("Session closed")
 	}()
 
 	driver, err := session.sshd.provider.CreateDriver(session.instanceID)
@@ -142,21 +143,25 @@ Done:
 			case "shell":
 				ptycon, ok := console.(hypervisor.PtyConsole)
 				if session.ptyreq != nil && ok {
-					if err := ptycon.AttachPty(connection, connection, connection.Stderr(), session.ptyreq); err != nil {
+					_, err := ptycon.AttachPty(session.console, session.ptyreq)
+					if err != nil {
 						reply = false
 						log.WithError(err).Error("Failed console.AttachPty")
+						break
 					}
 				} else {
-					if err := console.Attach(connection, connection, connection.Stderr()); err != nil {
+					_, err := console.Attach(session.console)
+					if err != nil {
 						reply = false
 						log.WithError(err).Error("Failed console.Attach")
+						break
 					}
 				}
-				if reply == true {
-					go func() {
-						quit <- console.Wait()
-					}()
-				}
+				go func() {
+					err := console.Wait()
+					log.WithError(err).Info("Console released")
+					quit <- err
+				}()
 			case "signal":
 				var msg struct {
 					Signal string
@@ -181,6 +186,58 @@ Done:
 				} else {
 					session.ptyreq = ptyreq
 				}
+			case "env":
+				var envReq struct {
+					Name  string
+					Value string
+				}
+				if err := ssh.Unmarshal(r.Payload, &envReq); err != nil {
+					log.WithError(errors.WithStack(err)).Error("Failed to parse env request body")
+					reply = false
+					break
+				}
+				session.console.Envs[envReq.Name] = envReq.Value
+			case "window-change":
+				winchMsg := struct {
+					Columns uint32
+					Rows    uint32
+					Width   uint32
+					Height  uint32
+				}{}
+				if err := ssh.Unmarshal(r.Payload, &winchMsg); err != nil {
+					log.WithError(errors.WithStack(err)).Error("Failed to parse window-change request body")
+					reply = false
+					break
+				}
+				ptycon, ok := console.(hypervisor.PtyConsole)
+				if session.ptyreq != nil && ok {
+					if err := ptycon.UpdateWindowSize(winchMsg.Columns, winchMsg.Rows); err != nil {
+						log.WithError(err).Error("Failed UpdateWindowSize")
+						reply = false
+						break
+					}
+				} else {
+					log.Warn("window-change sshreq for non-tty session")
+				}
+			case "exec":
+				var execMsg struct {
+					Command string
+				}
+				if err := ssh.Unmarshal(r.Payload, &execMsg); err != nil {
+					log.WithError(errors.WithStack(err)).Error("Failed to parse exec request body")
+					reply = false
+					break
+				}
+
+				// TODO: Skip /bin/sh -c if .Command does not contain shell keywords.
+				if _, err := console.Exec(session.console, []string{"/bin/sh", "-c", execMsg.Command}); err != nil {
+					log.WithError(err).Error("Failed console.Exec")
+					reply = false
+					break
+				}
+				go func() {
+					quit <- console.Wait()
+				}()
 			default:
 				reply = false
 				log.Warn("Unsupported session request")
@@ -199,23 +256,15 @@ Done:
 				_, err := connection.SendRequest("exit-status", false, ssh.Marshal(&msg))
 				if err != nil {
 					log.WithError(err).Error("Failed to send exit-status")
+				} else {
+					log.WithField("exit-status", msg.ExitStatus).Info("Reply exit-status")
 				}
 			}
 
-			if exiterr, ok := err.(*exec.ExitError); ok {
-				// http://stackoverflow.com/questions/10385551/get-exit-code-go
-				if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
-					sendExitStatus(uint32(status.ExitStatus()))
-				} else {
-					log.Warnf("This platform %s does not support syscall.WaitStatus: %v", runtime.GOOS, exiterr)
-					if exiterr.Success() {
-						sendExitStatus(0)
-					} else {
-						sendExitStatus(1)
-					}
-				}
+			if exiterr, ok := err.(hypervisor.ConsoleWaitError); ok {
+				sendExitStatus(uint32(exiterr.ExitCode()))
 			} else if err != nil {
-				log.WithError(err).Error("")
+				log.WithError(err).Error("Unknown Error")
 			} else {
 				// err == nil
 				sendExitStatus(0)

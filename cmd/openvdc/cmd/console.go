@@ -5,124 +5,45 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
+	"strings"
 
 	log "github.com/Sirupsen/logrus"
+	"github.com/axsh/openvdc/cmd/openvdc/cmd/console"
 	"github.com/axsh/openvdc/cmd/openvdc/internal/util"
 	"github.com/axsh/openvdc/model"
-	"github.com/shiena/ansicolor"
 
 	"github.com/axsh/openvdc/api"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
-
-const defaultTermInfo = "vt100"
-
-func sshShell(instanceID string, destAddr string) error {
-	config := &ssh.ClientConfig{
-		User:    instanceID,
-		Timeout: 5 * time.Second,
-	}
-	conn, err := ssh.Dial("tcp", destAddr, config)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	session, err := conn.NewSession()
-	if err != nil {
-		return err
-	}
-	defer session.Close()
-
-	session.Stdin = os.Stdin
-
-	// Handle control + C
-	cInt := make(chan os.Signal, 1)
-	defer close(cInt)
-	signal.Notify(cInt, os.Interrupt)
-
-	fd := int(os.Stdin.Fd())
-	if terminal.IsTerminal(fd) {
-		w, h, err := terminal.GetSize(fd)
-		if err != nil {
-			log.WithError(err).Warn("Failed to get console size. Set to 80x40")
-			w = 80
-			h = 40
-		}
-		modes := ssh.TerminalModes{
-			ssh.ECHO:  0, // Disable echoing
-			ssh.IGNCR: 1, // Ignore CR on input.
-		}
-		term, ok := os.LookupEnv("TERM")
-		if !ok {
-			term = defaultTermInfo
-		}
-		if err := session.RequestPty(term, h, w, modes); err != nil {
-			return err
-		}
-
-		origstate, err := terminal.MakeRaw(fd)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := terminal.Restore(fd, origstate); err != nil {
-				if errno, ok := err.(syscall.Errno); (ok && errno != 0) || !ok {
-					log.WithError(err).Error("Failed terminal.Restore")
-				}
-			}
-		}()
-		session.Stdout = ansicolor.NewAnsiColorWriter(os.Stdout)
-		session.Stderr = ansicolor.NewAnsiColorWriter(os.Stderr)
-	} else {
-		session.Stdout = os.Stdout
-		session.Stderr = os.Stderr
-	}
-
-	if err := session.Shell(); err != nil {
-		return err
-	}
-
-	quit := make(chan error, 1)
-	defer close(quit)
-
-	go func() {
-		quit <- session.Wait()
-	}()
-
-	for {
-		select {
-		case err := <-quit:
-			return err
-		case <-cInt:
-			if err := session.Signal(ssh.SIGINT); err != nil {
-				log.WithError(err).Error("Failed to send signal")
-			}
-		}
-	}
-}
 
 func init() {
 	consoleCmd.Flags().Bool("show", false, "Show console information")
 }
 
 var consoleCmd = &cobra.Command{
-	Use:   "console [Instance ID]",
-	Short: "Connect to an instance",
-	Long:  "Connect to an instance.",
+	Use:     "console [Instance ID] [options] [--] [commands]",
+	Short:   "Connect to an instance",
+	Long:    "Connect to an instance.",
+	Example: console.CommandExample,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) < 1 {
 			log.Fatal("Please provide an instance ID")
 		}
 
 		instanceID := args[0]
+		execArgs := []string{}
+		if len(args) > 1 {
+			for _, a := range args[1:] {
+				if a == "--" {
+					// Ignore args before "--"
+					execArgs = []string{}
+				}
+				execArgs = append(execArgs, a)
+			}
+		}
 
 		var res *api.ConsoleReply
 		err := util.RemoteCall(func(conn *grpc.ClientConn) error {
@@ -143,11 +64,19 @@ var consoleCmd = &cobra.Command{
 				if err != nil {
 					log.Fatal("Invalid ssh host address: ", res.GetAddress())
 				}
-				fmt.Printf("-p %s %s@%s\n", port, instanceID, host)
+				fmt.Printf("-p %s %s@%s", port, instanceID, host)
+				if len(execArgs) > 0 {
+					fmt.Printf(" %s", strings.Join(execArgs, " "))
+				}
+				fmt.Println("")
 				return nil
 			}
-			if err := sshShell(instanceID, res.GetAddress()); err != nil && err != io.EOF {
-				log.WithError(err).Fatal("Failed ssh to ", res.GetAddress())
+			sshcon := console.NewSshConsole(instanceID, nil)
+			var err error
+			if len(execArgs) > 0 {
+				err = sshcon.Exec(res.GetAddress(), execArgs)
+			} else {
+				err = sshcon.Run(res.GetAddress())
 			}
 			switch err.(type) {
 			case *ssh.ExitError:
