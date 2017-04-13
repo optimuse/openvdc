@@ -63,7 +63,7 @@ def stage_unit_test(label) {
 def stage_rpmbuild(label) {
   node(label) {
     stage "RPM Build ${label}"
-    #checkout_and_merge()
+    //checkout_and_merge()
     checkout scm
     write_build_env(label)
     sh "./ci/citest/rpmbuild/rpmbuild.sh ./build.env"
