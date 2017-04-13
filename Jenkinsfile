@@ -51,32 +51,33 @@ def checkout_and_merge() {
 @Field RELEASE_SUFFIX=null
 @Field SHA=null
 
-def stage_unit_test(label) {
-  node(label) {
-    stage "Units Tests ${label}"
-    checkout_and_merge()
-    write_build_env(label)
-    sh "./ci/citest/unit-tests/unit-tests.sh ./build.env"
-  }
-}
+#def stage_unit_test(label) {
+#  node(label) {
+#    stage "Units Tests ${label}"
+#    checkout_and_merge()
+#    write_build_env(label)
+#    sh "./ci/citest/unit-tests/unit-tests.sh ./build.env"
+#  }
+#}
 
 def stage_rpmbuild(label) {
   node(label) {
     stage "RPM Build ${label}"
-    checkout_and_merge()
+    #checkout_and_merge()
+    checkout scm
     write_build_env(label)
     sh "./ci/citest/rpmbuild/rpmbuild.sh ./build.env"
   }
 }
 
-def stage_acceptance(label) {
-  node("multibox") {
-    stage "Acceptance Test ${label}"
-    checkout_and_merge()
-    write_build_env(label)
-    sh "./ci/citest/acceptance-test/build_and_run_in_docker.sh ./build.env"
-  }
-}
+#def stage_acceptance(label) {
+#  node("multibox") {
+#    stage "Acceptance Test ${label}"
+#    checkout_and_merge()
+#    write_build_env(label)
+#    sh "./ci/citest/acceptance-test/build_and_run_in_docker.sh ./build.env"
+#  }
+#}
 
 node() {
     stage "Checkout"
