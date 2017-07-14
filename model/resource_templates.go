@@ -15,6 +15,8 @@ func (*NoneTemplate) isResourceTemplateKind() {}
 func (*NoneTemplate) ResourceName() string    { return "none" }
 func (*LxcTemplate) isResourceTemplateKind()  {}
 func (*LxcTemplate) ResourceName() string     { return "vm/lxc" }
+func (*QemuTemplate) isResourceTemplateKind()  {}
+func (*QemuTemplate) ResourceName() string     { return "vm/qemu" }
 func (*NullTemplate) isResourceTemplateKind() {}
 func (*NullTemplate) ResourceName() string    { return "vm/null" }
 
@@ -24,11 +26,14 @@ type InstanceResource interface {
 	// protobuf message belongs to InstanceResource should have fields below:
 	//  int32 vcpu = xx;
 	//  int32 memory_gb = xx;
+	//  repeated string node_groups = xx;
 	GetVcpu() int32
 	GetMemoryGb() int32
+	GetNodeGroups() []string
 }
 
 func (*LxcTemplate) isInstanceResourceKind()  {}
+func (*QemuTemplate) isInstanceResourceKind()  {}
 func (*NullTemplate) isInstanceResourceKind() {}
 
 // ResourceTemplate resolves the assigned object type of
@@ -46,4 +51,21 @@ func GetResourceTemplate(tmpl *Template) ResourceTemplate {
 
 func (t *Template) ResourceTemplate() ResourceTemplate {
 	return GetResourceTemplate(t)
+}
+
+func IsMatchingNodeGroups(res InstanceResource, offered []string) bool {
+	findIndex := func(set []string, group string) int {
+		for i, v := range set {
+			if v == group {
+				return i
+			}
+		}
+		return -1
+	}
+	for _, reqGroup := range res.GetNodeGroups() {
+		if findIndex(offered, reqGroup) < 0 {
+			return false
+		}
+	}
+	return true
 }

@@ -18,6 +18,7 @@ import (
 	"time"
 )
 
+const ProtocVersion = "libprotoc 3.2.0"
 var verbose = true
 
 // Similar to "$()" or "``" in sh
@@ -151,15 +152,28 @@ Environment Variables:
 		determineGHRef(),
 	)
 
+	if_not_exists("go-bindata", func() {
+		cmd("go", "get", "-u", "github.com/jteeuwen/go-bindata/...")
+	})
+	if_not_exists("go-bindata-assetfs", func() {
+		cmd("go", "get", "-u", "github.com/elazarl/go-bindata-assetfs/...")
+	})
+
 	if with_gogen {
 		if_not_exists("protoc", func() {
 			log.Fatal("Unable to find protoc. Download pre-compiled binary from https://github.com/google/protobuf/releases")
 		})
+		// Check protoc version
+		ver, err := exec.Command("protoc", "--version").Output()
+		if err != nil {
+			log.Fatalf("Failed to check protoc version: %v", err)
+		}
+		ver_str := strings.TrimSpace(string(ver))
+		if ver_str != ProtocVersion {
+			log.Fatalf("Unexpected protoc version: %s (expected: %s)", ver_str, ProtocVersion)
+		}
 		if_not_exists("protoc-gen-go", func() {
 			cmd("go", "get", "-u", "-v", "github.com/golang/protobuf/protoc-gen-go")
-		})
-		if_not_exists("go-bindata", func() {
-			cmd("go", "get", "-u", "github.com/jteeuwen/go-bindata/...")
 		})
 		cmd("go", "generate", "-v", "./api/...", "./model", "./registry")
 	}
@@ -172,11 +186,23 @@ Environment Variables:
 	// Build main binaries
 	cmd("go", "build", "-i", "./vendor/...")
 	cmd("go", "build", "-ldflags", LDFLAGS, "-v", "./cmd/openvdc")
-	cmd("go", "build", "-ldflags", LDFLAGS+"-X 'main.DefaultConfPath=/etc/openvdc/executor.toml'", "-v", "./cmd/openvdc-executor")
+	cmd("go", "build", "-ldflags", LDFLAGS+
+		" -X 'main.HostRsaKeyPath=/etc/openvdc/ssh/host_rsa_key'" +
+		" -X 'main.HostEcdsaKeyPath=/etc/openvdc/ssh/host_ecdsa_key'" +
+		" -X 'main.HostEd25519KeyPath=/etc/openvdc/ssh/host_ed25519_key'" +
+		" -X 'main.DefaultConfPath=/etc/openvdc/executor.toml'", "-v", "./cmd/openvdc-executor")
 	cmd("go", "build", "-ldflags", LDFLAGS+"-X 'main.DefaultConfPath=/etc/openvdc/scheduler.toml'", "-v", "./cmd/openvdc-scheduler")
+
+	//Build lxc-template
+	cmd("go", "build", "-ldflags", LDFLAGS+"-X 'main.lxcPath=/usr/share/lxc/'", "-v", "-o", "./lxc-openvdc", "./cmd/lxc-openvdc/")
+
+	//Build qemu-ifup/qemi-ifdown
+	cmd("go", "build", "-ldflags", LDFLAGS+"-X 'main.DefaultConfPath=/etc/openvdc/executor.toml'", "-v", "-o", "./qemu-ifup", "./cmd/qemu-ifup")
+	cmd("go", "build", "-ldflags", LDFLAGS+"-X 'main.DefaultConfPath=/etc/openvdc/executor.toml'", "-v", "-o", "./qemu-ifdown", "./cmd/qemu-ifdown")
 
 	// Build Acceptance Test binary
 	os.Chdir("./ci/citest/acceptance-test/tests")
 	cmd("govendor", "sync")
+	cmd("go", "generate", "-v", "-tags=acceptance", ".")
 	cmd("go", "test", "-tags=acceptance", "-c", "-o", "openvdc-acceptance-test")
 }

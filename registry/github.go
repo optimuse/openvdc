@@ -2,6 +2,7 @@ package registry
 
 import (
 	"archive/zip"
+	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	log "github.com/Sirupsen/logrus"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -76,6 +78,38 @@ func (r *GithubRegistry) localCachePath() string {
 
 // Find queries resource template details from local registry cache.
 func (r *GithubRegistry) Find(templateName string) (*RegistryTemplate, error) {
+	f, err := r.openCached(templateName)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	tmpl, err := parseResourceTemplate(f)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed to parse template %s", templateName)
+	}
+	rt := &RegistryTemplate{
+		Name:     templateName,
+		source:   r,
+		Template: tmpl,
+	}
+	return rt, nil
+}
+
+func (r *GithubRegistry) LoadRaw(templateName string) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	f, err := r.openCached(templateName)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if _, err := io.Copy(buf, f); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (r *GithubRegistry) openCached(templateName string) (*os.File, error) {
 	if !r.ValidateCache() {
 		return nil, ErrLocalCacheNotReady
 	}
@@ -86,18 +120,7 @@ func (r *GithubRegistry) Find(templateName string) (*RegistryTemplate, error) {
 		}
 		return nil, err
 	}
-	defer f.Close()
-
-	tmpl, err := parseResourceTemplate(f)
-	if err != nil {
-		return nil, err
-	}
-	rt := &RegistryTemplate{
-		Name:     templateName,
-		source:   r,
-		Template: tmpl,
-	}
-	return rt, nil
+	return f, nil
 }
 
 // ValidateCache validates the local cache folder items.

@@ -1,10 +1,10 @@
 # OpenVDC Acceptance Test
 
-![Test environment drawing](illustrations/drawing.png)
+This is the environment used on the OpenVDC CI to run the integration tests.
 
-## Quick start
+[Click here for a visual illustration of the CI environment](illustrations/acceptance-test.svg)
 
-This is the environment used on the OpenVDC CI to run the integration tests. To run this environment locally first make a file containing the following environment variables.
+To run this environment locally first make a file containing the following environment variables.
 
 ```
 # The following two lines make up the yum repository from which we'll download OpenVDC packages to test
@@ -45,9 +45,11 @@ Now edit `ci/citest/acceptance-test/multibox/config.source` and tell it to use t
 ```
 #BOXES_DIR="/data/openvdc-ci/boxes"
 #CACHE_DIR="/data/openvdc-ci/branches"
+#IMG_DIR="/data/openvdc-ci/images"
 
 BOXES_DIR="$HOME/work/openvdc-multibox-data/openvdc-ci/boxes"
 CACHE_DIR="$HOME/work/openvdc-multibox-data/openvdc-ci/branches"
+IMG_DIR="$HOME/work/openvdc-multibox-data/openvdc-ci/images"
 ```
 
 Now build the environment.

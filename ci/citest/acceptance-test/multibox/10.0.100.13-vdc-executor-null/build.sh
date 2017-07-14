@@ -8,16 +8,14 @@ TMP_ROOT="${NODE_DIR}/tmp_root"
 . "${NODE_DIR}/vmspec.conf"
 . "${ENV_ROOTDIR}/ind-steps/common.source"
 
-mesos_agent=true
-
 IND_STEPS=(
     "box"
     "ssh"
     "hosts"
     "disable-firewalld"
     "epel"
-    "mesosphere"
-    "mesos"
+    "mesosphere-repo"
+    "mesos-agent"
 )
 
 build "${IND_STEPS[@]}"
@@ -26,4 +24,4 @@ build "${IND_STEPS[@]}"
 # the cached images. We want a clean cache without OpenVDC so we can install a
 # different version to test every the CI runs.
 install_openvdc_yum_repo
-install_yum_package_over_ssh "openvdc-executor"
+install_yum_package_over_ssh "openvdc-executor-null"

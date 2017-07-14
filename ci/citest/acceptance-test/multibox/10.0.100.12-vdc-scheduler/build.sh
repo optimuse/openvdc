@@ -9,13 +9,20 @@ TMP_ROOT="${NODE_DIR}/tmp_root"
 . "${ENV_ROOTDIR}/ind-steps/common.source"
 
 scheduler=true
+zk_host=true
 
 IND_STEPS=(
     "box"
     "ssh"
     "hosts"
     "disable-firewalld"
+    "apache"
+    "mesosphere-repo"
+    "zookeeper"
+    "vdc-images"
 )
+
+image_type=lxc
 
 build "${IND_STEPS[@]}"
 
@@ -25,3 +32,4 @@ build "${IND_STEPS[@]}"
 install_openvdc_yum_repo
 install_yum_package_over_ssh "openvdc-scheduler"
 enable_service_over_ssh "openvdc-scheduler"
+enable_service_over_ssh "httpd"

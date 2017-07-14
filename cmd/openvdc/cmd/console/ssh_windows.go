@@ -3,11 +3,12 @@
 package console
 
 import (
+	"io"
 	"os"
 	"os/signal"
-	"syscall"
-	"unsafe"
 
+	"github.com/Azure/go-ansiterm"
+	"github.com/Azure/go-ansiterm/winterm"
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/ssh"
 )
@@ -17,8 +18,20 @@ PS> openvdc console i-000000001
 root@i-00000001#
 `
 
+func (s *SshConsole) bindFDs(session *ssh.Session) (func() error, error) {
+	closeFunc := func() error { return nil }
+	session.Stdin = os.Stdin
+	session.Stdout = newAnsiWriter(os.Stdout)
+	session.Stderr = newAnsiWriter(os.Stderr)
+	return closeFunc, nil
+}
+
 func (s *SshConsole) getWinSize(fd uintptr) (int, int, error) {
-	return getSize(fd)
+	info, err := winterm.GetConsoleScreenBufferInfo(fd)
+	if err != nil {
+		return 0, 0, errors.Wrap(err, "winterm.GetnConsoleScreenBufferInfo")
+	}
+	return int(info.Window.Right - info.Window.Left + 1), int(info.Window.Bottom - info.Window.Top + 1), nil
 }
 
 func (s *SshConsole) signal(c chan<- os.Signal) error {
@@ -39,45 +52,21 @@ func (s *SshConsole) signalHandle(sig os.Signal, session *ssh.Session) error {
 	return nil
 }
 
-// terminal.GetSize() on windows does not return the window dimension. It returns
-// the console buffer depth can be seen in scrolled area.
-// Stolen from golang.org/x/crypto/ssh/terminal/util_windows.go
+// Stolen from github.com/docker/docker/pkg/term/windows/ansi_writer.go
 
-var kernel32 = syscall.NewLazyDLL("kernel32.dll")
-
-var (
-	procGetConsoleScreenBufferInfo = kernel32.NewProc("GetConsoleScreenBufferInfo")
-)
-
-type (
-	short int16
-	word  uint16
-
-	coord struct {
-		x short
-		y short
+func newAnsiWriter(out *os.File) io.Writer {
+	return &ansiWriter{
+		parser: ansiterm.CreateParser("Ground", winterm.CreateWinEventHandler(out.Fd(), out)),
 	}
-	smallRect struct {
-		left   short
-		top    short
-		right  short
-		bottom short
-	}
-	consoleScreenBufferInfo struct {
-		size              coord
-		cursorPosition    coord
-		attributes        word
-		window            smallRect
-		maximumWindowSize coord
-	}
-)
+}
 
-// GetSize returns the dimensions of the given terminal.
-func getSize(fd uintptr) (width, height int, err error) {
-	var info consoleScreenBufferInfo
-	_, _, e := syscall.Syscall(procGetConsoleScreenBufferInfo.Addr(), 2, fd, uintptr(unsafe.Pointer(&info)), 0)
-	if e != 0 {
-		return 0, 0, error(e)
+type ansiWriter struct {
+	parser *ansiterm.AnsiParser
+}
+
+func (w *ansiWriter) Write(buf []byte) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
 	}
-	return int(info.window.right - info.window.left + 1), int(info.window.bottom - info.window.top + 1), nil
+	return w.parser.Parse(buf)
 }
