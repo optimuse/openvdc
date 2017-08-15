@@ -14,7 +14,8 @@ License: LGPLv3
 BuildArch: x86_64
 
 BuildRequires: rpmdevtools lxc-devel git
-BuildRequires: golang >= 1.7
+# CentOS 7.3 does not have official Go 1.8 package.
+#BuildRequires: golang >= 1.8
 
 Requires: mesosphere-zookeeper mesos
 Requires: bridge-utils
@@ -53,6 +54,8 @@ mkdir -p "$RPM_BUILD_ROOT"/etc/openvdc/scripts
 mkdir -p "$RPM_BUILD_ROOT"/etc/openvdc/ssh
 mkdir -p "$RPM_BUILD_ROOT"/usr/bin
 ln -sf /opt/axsh/openvdc/bin/openvdc  "$RPM_BUILD_ROOT"/usr/bin
+mkdir -p "$RPM_BUILD_ROOT"/usr/sbin
+ln -sf /opt/axsh/openvdc/bin/openvdc-executor  "$RPM_BUILD_ROOT"/usr/sbin
 cp openvdc "$RPM_BUILD_ROOT"/opt/axsh/openvdc/bin
 cp openvdc-executor "$RPM_BUILD_ROOT"/opt/axsh/openvdc/bin
 cp openvdc-scheduler "$RPM_BUILD_ROOT"/opt/axsh/openvdc/bin
@@ -100,6 +103,7 @@ OpenVDC executor common package.
 /opt/axsh/openvdc/share/qemu-ifdown
 %dir /etc/openvdc
 %dir /etc/openvdc/ssh
+/usr/sbin/openvdc-executor
 
 %post executor
 test ! -f /etc/openvdc/ssh/host_rsa_key && /usr/bin/ssh-keygen -q -t rsa -f /etc/openvdc/ssh/host_rsa_key -b 4096 -C '' -N '' >&/dev/null;
@@ -131,6 +135,8 @@ Requires: lxc
 # lxc-templates does not resolve its sub dependencies
 Requires: lxc-templates wget gpg sed gawk coreutils rsync debootstrap dropbear
 Requires: iproute
+# Needed for unpacking local images
+Requires: tar xz
 
 %description executor-lxc
 LXC driver configuration package for OpenVDC executor.
@@ -155,7 +161,7 @@ Summary: OpenVDC executor (Qemu driver)
 Requires: openvdc-executor
 Requires: qemu-system-x86
 Requires: dosfstools
- 
+
 %description executor-qemu
 Qemu driver configuration package for OpenVDC executor
 
